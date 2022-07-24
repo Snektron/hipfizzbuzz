@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include <sys/uio.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -349,20 +350,12 @@ struct SwapBuffer {
     hipEvent_t event;
     size_t current_bytes;
 
-    SwapBuffer(size_t max_bytes): current_bytes(0) {
-        #if HIPFIZZBUZZ_COPY_MEM
-            HIP_CHECK(hipMalloc(&this->d_buffer, max_bytes));
-        #else
-            HIP_CHECK(hipMallocManaged(&this->d_buffer, max_bytes));
-        #endif
-        HIP_CHECK(hipHostMalloc(&this->h_buffer, max_bytes, 0));
+    SwapBuffer(uint8_t* d_buffer, uint8_t* h_buffer): d_buffer(d_buffer), h_buffer(h_buffer), current_bytes(0) {
         HIP_CHECK(hipEventCreate(&this->event));
     }
 
     ~SwapBuffer() {
         HIP_CHECK(hipEventSynchronize(this->event));
-        HIP_CHECK(hipFree(this->d_buffer));
-        HIP_CHECK(hipFree(this->h_buffer));
         HIP_CHECK(hipEventDestroy(this->event));
     }
 
@@ -446,6 +439,19 @@ void generate(hipStream_t stream, size_t& batch_index, std::array<SwapBuffer, nu
     }
 }
 
+template <typename T>
+constexpr T align_addr_forward(T addr, size_t align) {
+    if (addr % align == 0) {
+        return addr;
+    }
+    return addr + align - addr % align;
+}
+
+template <typename T>
+T* align_forward(T* ptr, size_t align) {
+    return reinterpret_cast<T*>(align_addr_forward(reinterpret_cast<uintptr_t>(ptr), align));
+}
+
 int main() {
     std::cerr << "generating " << lines_per_batch << " lines per batch" << std::endl;
     std::cerr << "generating " << bytes_per_batch << " bytes per batch" << std::endl;
@@ -457,8 +463,40 @@ int main() {
         }
     #endif
 
-    auto swap_buffers = []<size_t... I>(std::index_sequence<I...>) {
-        return std::array{(static_cast<void>(I), SwapBuffer(bytes_per_batch))...};
+    // Round up allocations to a multiple of the huge page size
+    constexpr size_t huge_page_size = 2 * 1024 * 1024;
+    constexpr size_t swap_buffer_size = align_addr_forward(bytes_per_batch, huge_page_size);
+    const size_t total_buffer_size = swap_buffer_size * num_swap_buffers;
+    // Allocate twice the amount so we are guaranteed that we can find
+    // a suitably aligned offset in the buffers.
+    const size_t alloc_size = 2 * total_buffer_size;
+
+    uint8_t* d_buffer;
+    uint8_t* h_buffer;
+
+    #if HIPFIZZBUZZ_COPY_MEM
+        HIP_CHECK(hipMalloc(&d_buffer, alloc_size));
+    #else
+        HIP_CHECK(hipMallocManaged(&d_buffer, alloc_size));
+    #endif
+    HIP_CHECK(hipHostMalloc(&h_buffer, alloc_size, 0));
+
+    // Align to huge page size...
+    d_buffer = align_forward(d_buffer, huge_page_size);
+    h_buffer = align_forward(h_buffer, huge_page_size);
+
+    #if !HIPFIZZBUZZ_COPY_MEM
+        if (madvise(d_buffer, total_buffer_size, MADV_HUGEPAGE) < 0) {
+            std::cerr << "failed to madvise(): " << strerror(errno) << std::endl;
+        }
+    #endif
+
+    if (madvise(h_buffer, total_buffer_size, MADV_HUGEPAGE) < 0) {
+        std::cerr << "failed to madvise(): " << strerror(errno) << std::endl;
+    }
+
+    auto swap_buffers = [&]<size_t... i>(std::index_sequence<i...>) {
+        return std::array{SwapBuffer(d_buffer + i * swap_buffer_size, h_buffer + i * swap_buffer_size)...};
     }(std::make_index_sequence<num_swap_buffers>());
 
     hipStream_t stream = 0; // Default stream
